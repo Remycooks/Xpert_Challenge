@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cold Start v1: rules only, no model calls.
+"""Cold Start v1.1: rules only, no model calls.
 
     python3 solution.py <input_dir> <output.json>
 
@@ -8,8 +8,8 @@ Parts:
      A Home organisation from household words and staff. Leftover work groups become extra orgs.
   2. Chats: groups go to their organisation; a 1:1 goes to the org the other person runs/supports,
      otherwise to the person.
-  3. Circles: seed, then org membership (colleague / staff), family surname (relative), then simple
-     keyword rules. Everything else is "friend".
+  3. Circles: seed, then family surname (relative), then org membership (colleague / staff), then
+     simple keyword rules. Everything else is "friend".
 Goals and open loops come in v2 (model-based).
 Never hardcode names: the hidden set renames everyone again.
 """
@@ -29,7 +29,7 @@ HOME_RE = re.compile(
     r"grocery|groceries|maid|cook|driver|\b\d+\s?[a-d]\b)", re.I)
 WORK_GROUP_RE = re.compile(
     r"\b(ops|operations|team|office|admin|accounts|finance|hr|sales|marketing|tech|product|"
-    r"leadership|founders|management|core|milestone|project|pvt|ltd|llp)\b", re.I)
+    r"leadership|management|pvt|ltd|llp)\b", re.I)
 VENDOR_RE = re.compile(r"\b(invoice|quotation|quote|bill|estimate|delivery|dispatch|order confirmed)\b", re.I)
 CLIENT_RE = re.compile(r"\b(campaign|proposal|deck|deliverable|brief|retainer|po\b|purchase order|onboard)", re.I)
 
@@ -88,6 +88,17 @@ def main(input_dir, output_path):
             names[other][c["name"]] += 5
     display = {p: (names[p].most_common(1)[0][0] if names[p] else "") for p in people}
 
+    # Family: surnames of seeded family, plus any surname shared by 3+ 1:1 contacts.
+    family_tags = {"spouse", "child", "parent", "in-law", "sibling", "relative"}
+    nonwork_tags = family_tags | {"friend", "client", "vendor"}
+    fam_surnames = {surname(display[p]) for p, c in seed_circles.items() if c in family_tags}
+    dm_surnames = collections.Counter(surname(display[p]) for p in dm_with)
+    fam_surnames |= {s for s, n in dm_surnames.items() if s and n >= 3}
+    fam_surnames.discard(None)
+    family = {p for p in people if seed_circles.get(p) in family_tags
+              or (p not in seed_circles and surname(display[p]) in fam_surnames)}
+    not_core = family | {p for p, c in seed_circles.items() if c in nonwork_tags}
+
     sent = collections.Counter()           # (chat, person) -> messages sent
     text_by_person = collections.defaultdict(list)
     for m in messages:
@@ -103,35 +114,58 @@ def main(input_dir, output_path):
         orgs.append({"id": f"org{i+1}", "name": oname, "type": "company", "side": "work",
                      "role": "owner", "chats": matched, "core": set()})
 
-    def find_core(org):
-        """People active in at least two of the org's groups, or very active in one."""
-        appear = collections.Counter()
-        for cid in org["chats"]:
-            for p in chat_by_id[cid]["participants"]:
-                if p != "ME" and (sent[(cid, p)] >= 1 or len(org["chats"]) > 1):
-                    appear[p] += 1
-        many = len(org["chats"]) >= 2
-        return {p for p, n in appear.items()
-                if (many and n >= 2 and sum(sent[(c, p)] for c in org["chats"]) >= 2)
-                or sum(sent[(c, p)] for c in org["chats"]) >= 15}
+    seeded_work = {p for p, c in seed_circles.items() if c in ("colleague", "partner")}
 
+    def find_core(org):
+        """The people who run it with Arjun: active in its chats, and either in a 1:1 with Arjun
+        or seeded as colleague/partner. Community members in big groups stay out."""
+        core = set()
+        for p in people:
+            if p in not_core:
+                continue
+            n_sent = sum(sent[(c, p)] for c in org["chats"])
+            n_chats = sum(1 for c in org["chats"] if p in chat_by_id[c]["participants"])
+            if (p in dm_with or p in seeded_work) and (n_sent >= 3 or (n_chats >= 2 and n_sent >= 1)):
+                core.add(p)
+            elif n_sent >= 30:
+                core.add(p)
+        return core
+
+    def first_token(name):
+        t = re.findall(r"[a-z0-9]+", name.lower())
+        return t[0] if t and len(t[0]) >= 3 and len(t) >= 2 else None
+
+    def is_family_group(g):
+        members = set(g["participants"]) - {"ME"}
+        return members and len(members & family) / len(members) >= 0.4
+
+    taken = set().union(*(o["chats"] for o in orgs)) if orgs else set()
+    for _ in range(2):  # expand, then recompute core with the new chats, then expand again
+        for org in orgs:
+            org["core"] = find_core(org)
+        # A group joins the work org with most of its core people in it (one is enough).
+        for g in groups:
+            if g["chat_id"] in taken or HOME_RE.search(g["name"]) or is_family_group(g):
+                continue
+            members = set(g["participants"]) - {"ME"}
+            best, best_n = None, 0
+            for org in orgs:
+                n = len(members & org["core"])
+                if n > best_n:
+                    best, best_n = org, n
+            if best:
+                best["chats"].add(g["chat_id"])
+                taken.add(g["chat_id"])
+        # Groups named like an org's groups ("D2C Circle ...", "D2B Connect ...") join it too.
+        for org in orgs:
+            prefixes = {first_token(chat_by_id[c]["name"]) for c in org["chats"]} - {None}
+            for g in groups:
+                if g["chat_id"] not in taken and first_token(g["name"]) in prefixes \
+                        and not is_family_group(g):
+                    org["chats"].add(g["chat_id"])
+                    taken.add(g["chat_id"])
     for org in orgs:
         org["core"] = find_core(org)
-
-    # Expand: an unmatched group joins the work org whose core people fill it most.
-    taken = set().union(*(o["chats"] for o in orgs)) if orgs else set()
-    for g in groups:
-        if g["chat_id"] in taken or HOME_RE.search(g["name"]):
-            continue
-        members = set(g["participants"]) - {"ME"}
-        best, best_n = None, 0
-        for org in orgs:
-            n = len(members & org["core"])
-            if n > best_n:
-                best, best_n = org, n
-        if best and best_n >= 2 and best_n / max(1, len(members)) >= 0.15:
-            best["chats"].add(g["chat_id"])
-            taken.add(g["chat_id"])
 
     # Home: household groups, plus staff.
     staff = {p for p in people
@@ -151,7 +185,7 @@ def main(input_dir, output_path):
     # Leftover work-looking groups become their own small orgs, merged by member overlap.
     extra = []
     for g in groups:
-        if g["chat_id"] in taken or not WORK_GROUP_RE.search(g["name"]):
+        if g["chat_id"] in taken or not WORK_GROUP_RE.search(g["name"]) or is_family_group(g):
             continue
         members = set(g["participants"]) - {"ME"}
         for e in extra:
@@ -168,13 +202,14 @@ def main(input_dir, output_path):
         if j < room:
             org = {"id": f"x{j+1}", "name": e["name"], "type": "company", "side": "work",
                    "role": "partner", "chats": e["chats"], "core": set()}
-            org["core"] = {p for p in e["members"] if sum(sent[(c, p)] for c in e["chats"]) >= 3}
+            org["core"] = {p for p in e["members"] - not_core if sum(sent[(c, p)] for c in e["chats"]) >= 3}
             orgs.append(org)
         else:
             taken -= e["chats"]
     orgs.append(home)
 
     # Which org each person belongs to (the one where they talk most).
+    n_orgs = collections.Counter(p for o in orgs for p in o["core"])
     person_org = {}
     for p in people:
         best, best_n = None, 0
@@ -195,8 +230,8 @@ def main(input_dir, output_path):
             ties.append({"chat_id": cid, "organisation": chat_org[cid]["id"]})
         elif not c["is_group"]:
             other = next((p for p in c["participants"] if p != "ME"), None)
-            if other in person_org and seed_circles.get(other) not in (
-                    "spouse", "child", "parent", "in-law", "sibling", "relative", "friend", "client", "vendor"):
+            # 1:1 goes to the org only for someone who works in exactly one of them.
+            if other in person_org and other not in not_core and n_orgs[other] == 1:
                 ties.append({"chat_id": cid, "organisation": person_org[other]["id"]})
             else:
                 ties.append({"chat_id": cid, "person": other})
@@ -206,25 +241,18 @@ def main(input_dir, output_path):
             ties.append({"chat_id": cid, "person": top})
 
     # ---------- 3. Circles ----------
-    # Family surname: surnames of seeded family, plus any surname shared by 3+ 1:1 contacts.
-    family_tags = {"spouse", "child", "parent", "in-law", "sibling", "relative"}
-    fam_surnames = {surname(display[p]) for p, c in seed_circles.items() if c in family_tags}
-    dm_surnames = collections.Counter(surname(display[p]) for p in dm_with)
-    fam_surnames |= {s for s, n in dm_surnames.items() if s and n >= 3}
-    fam_surnames.discard(None)
-
     circles = {}
     for p in people:
         if p in seed_circles:
             circles[p] = seed_circles[p]
             continue
         org = person_org.get(p)
-        if org is home or p in staff:
+        if p in family:
+            circles[p] = "relative"
+        elif org is home or p in staff:
             circles[p] = "staff"
         elif org is not None:
             circles[p] = "colleague" if org["role"] == "owner" else "partner"
-        elif surname(display[p]) in fam_surnames:
-            circles[p] = "relative"
         elif p in dm_with:
             txt = " ".join(text_by_person[p])
             if VENDOR_RE.search(txt):
